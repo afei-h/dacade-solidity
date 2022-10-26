@@ -1,19 +1,29 @@
+import "@openzeppelin/contracts/access/Ownable.sol";
+
 // SPDX-License-Identifier: GPL-3.0
 
 pragma solidity >=0.8.0 <0.9.0;
 
+error Bounties__BountyCompleted(bytes32 hash);
+error Bounties__NotFounder(address user);
+error Bounties__ApplicantNotPayed();
+error Bounties__BountyCreated();
+error Bounties__BountyExpired();
+error Bounties__CheckExpiry();
+error Bounties__CheckReward();
+error Bounties__FunderCannotApply();
+error Bounties__OnlyApplicant();
+error Bounties__NoOneHasSubmitted();
+error Bounties__MustBeAnApplicant();
 /**
  * @title Bounty contract
  * @notice This contract allows users to post bounties or apply for a bounty.
  */
-contract Bounties {
+contract Bounties is Ownable{
 
     /// @notice Public Variable to store the compensation ratio (default 20%)
     /// @dev 1/compensationRate of the total bounty reward will be used as compensation for applicants. could be modified by contract owner
     uint256 public compensationRate = 5;
-
-    /// @notice Public Variable to store the address of the contract owner
-    address public owner;
 
     /// @notice Public variable to look up the bounties through the hashvalue of the bounty content
     /// @dev mapping from hashvalue of the bounty content address bounty states
@@ -46,6 +56,7 @@ contract Bounties {
 
     /// @dev prevent reentrant attacks
     bool private locked = false;
+
     modifier lock() {
         require(locked == false, 'contract locked!');
         locked = true;
@@ -53,15 +64,19 @@ contract Bounties {
         locked = false;
     }
 
-    /// @dev a restriction for functions that can only be called by contract owner
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Caller is not owner");
+
+    modifier onlyFunder(bytes32 _contentHash) {
+        if(bounties[_contentHash].funder != msg.sender){
+            revert Bounties__NotFounder(msg.sender);
+        }
         _;
     }
 
-
-    constructor(){
-        owner = msg.sender;
+    modifier notComplete(bytes32 _contentHash) {
+        if(bounties[_contentHash].isAccomplished){
+            revert Bounties__BountyCompleted(_contentHash);
+        }
+        _;
     }
 
 
@@ -98,10 +113,13 @@ contract Bounties {
     /// @notice post a bounty
     /// @dev the hashvalue of the bounty content is used for index number
     function postBounty (string memory _bountyContent, uint256 _expires) public payable {
-        require(msg.value > 0, "You should pay applicants!");
-        require(_expires > block.timestamp, "bounty expired!");
+        if(msg.value <= 0){
+            revert Bounties__ApplicantNotPayed();
+        }
         bytes32 contentHash = keccak256(abi.encodePacked(_bountyContent));
-        require(bounties[contentHash].expires == 0, "bounty already created!");
+        if(bounties[contentHash].expires > 0){
+            revert Bounties__BountyCreated();
+        }
 
         //msg.sender is passed to Bounty.funder, msg.value is passed to Bounty.reward
         bounties[contentHash] = Bounty(msg.sender, _expires, msg.value, false, false);
@@ -112,13 +130,20 @@ contract Bounties {
     /// @notice apply for a bounty
     /// @dev use hashvalue of the bounty content rather than string to cut gas costs. 
     /// @dev check expires and reward to make sure the applicant is well informed about the details of the bounty
-    function applyBounty (bytes32 _contentHash, uint256 _expires, uint256 _reward) public {
+    function applyBounty (bytes32 _contentHash, uint256 _expires, uint256 _reward) public notComplete(_contentHash){
         //Bounty storage bounty = bounties[_contentHash]; => This way would cost more gas.
-        require(block.timestamp < bounties[_contentHash].expires, "bounty expired!");
-        require(bounties[_contentHash].expires == _expires, "check the expires!");
-        require(bounties[_contentHash].reward == _reward, "check the reward!");
-        require(bounties[_contentHash].funder != msg.sender, "you can't apply yourself!");
-        require(!bounties[_contentHash].isAccomplished, "bounty is already completed!");
+        if(block.timestamp > bounties[_contentHash].expires){
+            revert Bounties__BountyExpired();
+        }
+        if(bounties[_contentHash].expires > _expires){
+            revert Bounties__CheckExpiry();
+        }
+        if(bounties[_contentHash].reward > _reward){
+            revert Bounties__CheckReward();
+        }
+        if(bounties[_contentHash].funder == msg.sender){
+            revert Bounties__FunderCannotApply();
+        }
 
         applicants[_contentHash].push(msg.sender);
         isApplicant[msg.sender][_contentHash] = true;
@@ -127,18 +152,22 @@ contract Bounties {
 
     /// @notice applicant should call this after submitting solution to the funder
     function submit(bytes32 _contentHash) public {
-        require(isApplicant[msg.sender][_contentHash], "only an applicant could call this!");
+        if(!isApplicant[msg.sender][_contentHash]){
+            revert Bounties__OnlyApplicant();
+        }
         bounties[_contentHash].isSubmitted = true;
 
         emit someoneSubmitted(_contentHash, msg.sender);
     } 
 
     /// @notice end the bounty, after the funder accepted one of the submitions
-    function completeBounty(bytes32 _contentHash, address payable winner) public lock {
-        require(bounties[_contentHash].funder == msg.sender, "only the funder has the right to end this bounty!");
-        require(!bounties[_contentHash].isAccomplished, "bounty is already completed!");
-        require(bounties[_contentHash].isSubmitted, "no one has submit a solution!");
-        require(isApplicant[winner][_contentHash], "winner must be an applicant!");
+    function completeBounty(bytes32 _contentHash, address payable winner) public lock onlyFunder(_contentHash) notComplete(_contentHash){
+        if(!bounties[_contentHash].isSubmitted){
+            revert Bounties__NoOneHasSubmitted();
+        }
+        if(!isApplicant[winner][_contentHash]){
+            revert Bounties__MustBeAnApplicant();
+        }
 
         bounties[_contentHash].isAccomplished = true;
         winner.transfer(bounties[_contentHash].reward);
@@ -148,9 +177,7 @@ contract Bounties {
 
 
     /// @notice withdraw the bounty(only by funder)
-    function withdrawBounty(bytes32 _contentHash) public lock {
-        require(bounties[_contentHash].funder == msg.sender, "only the funder has the right to withdraw this bounty!");
-        require(!bounties[_contentHash].isAccomplished, "bounty is already completed!");
+    function withdrawBounty(bytes32 _contentHash) public lock onlyFunder(_contentHash) notComplete(_contentHash){
 
         //if withdraw before expirs, funder must compensate all applicants
         uint256 applicantNum = applicants[_contentHash].length;
